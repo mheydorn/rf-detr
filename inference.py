@@ -55,6 +55,7 @@ import cv2
 import json
 import numpy as np
 import torch
+import time
 from pathlib import Path
 from docopt import docopt
 from datetime import datetime
@@ -478,18 +479,23 @@ def run_inference(
     model_class = model_classes[model_size.lower()]
     
     print("\nLoading model...")
+    t_load_start = time.perf_counter()
     model = model_class(
         num_classes=num_classes,
         pretrain_weights=str(weights_path),
         segmentation_head=segmentation,
         device=device,
     )
+    t_load_end = time.perf_counter()
+    print(f"Model loaded in {t_load_end - t_load_start:.3f}s")
     
     # Optimize for inference
     print("Optimizing model for inference...")
+    t_opt_start = time.perf_counter()
     try:
         model.optimize_for_inference()
-        print("Model optimization successful")
+        t_opt_end = time.perf_counter()
+        print(f"Model optimization successful ({t_opt_end - t_opt_start:.3f}s)")
     except Exception as e:
         print(f"Warning: Could not optimize model: {e}")
     
@@ -515,17 +521,33 @@ def run_inference(
     
     total_detections = 0
     
+    # Timing statistics
+    image_load_times = []
+    inference_times = []
+    postprocess_times = []
+    total_times = []
+    
+    t_total_start = time.perf_counter()
+    
     # Process each image
     for img_path in image_paths:
+        t_img_start = time.perf_counter()
         print(f"Processing: {img_path.name}")
         
         # Load image
+        t_load_start = time.perf_counter()
         image = Image.open(img_path).convert('RGB')
         img_width, img_height = image.size
+        t_load_end = time.perf_counter()
+        image_load_times.append(t_load_end - t_load_start)
         
         # Run inference with very low threshold to get ALL detections
         # This ensures COCO output contains all predictions with scores
+        t_infer_start = time.perf_counter()
         all_detections = model.predict(image, threshold=0.01)
+        t_infer_end = time.perf_counter()
+        inference_times.append(t_infer_end - t_infer_start)
+        print(f"  Inference time: {t_infer_end - t_infer_start:.3f}s")
         
         # Create mapping from model's category IDs to class indices
         # This handles cases where training data used non-zero-indexed categories (e.g., 1, 2 instead of 0, 1)
@@ -569,6 +591,7 @@ def run_inference(
             })
         
         # Process ALL detections for COCO output and mask saving
+        t_postprocess_start = time.perf_counter()
         txt_lines = []
         masks_list = []
         class_ids_list = []
@@ -681,7 +704,18 @@ def run_inference(
             vis_path = vis_dir / f"{img_path.stem}_vis.png"
             Image.fromarray(image_np).save(str(vis_path))
         
+        t_postprocess_end = time.perf_counter()
+        t_img_end = time.perf_counter()
+        
+        postprocess_times.append(t_postprocess_end - t_postprocess_start)
+        total_times.append(t_img_end - t_img_start)
+        
+        print(f"  Postprocessing time: {t_postprocess_end - t_postprocess_start:.3f}s")
+        print(f"  Total image time: {t_img_end - t_img_start:.3f}s")
+        
         image_id += 1
+    
+    t_total_end = time.perf_counter()
     
     # Save COCO JSON
     if save_coco:
@@ -698,6 +732,21 @@ def run_inference(
     print(f"Processed: {len(image_paths)} images")
     print(f"Total detections: {total_detections} (all confidence levels)")
     print(f"Results saved to: {output_dir}")
+    
+    # Print timing statistics
+    print(f"\n{'='*80}")
+    print(f"Performance Metrics")
+    print(f"{'='*80}")
+    print(f"Total processing time: {t_total_end - t_total_start:.3f}s")
+    print(f"\nPer-image averages:")
+    print(f"  Image loading:    {np.mean(image_load_times):.3f}s (±{np.std(image_load_times):.3f}s)")
+    print(f"  Inference:        {np.mean(inference_times):.3f}s (±{np.std(inference_times):.3f}s)")
+    print(f"  Postprocessing:   {np.mean(postprocess_times):.3f}s (±{np.std(postprocess_times):.3f}s)")
+    print(f"  Total per image:  {np.mean(total_times):.3f}s (±{np.std(total_times):.3f}s)")
+    print(f"\nThroughput:")
+    print(f"  Images per second: {len(image_paths) / (t_total_end - t_total_start):.2f}")
+    print(f"  FPS (inference only): {1.0 / np.mean(inference_times):.2f}")
+    print(f"{'='*80}")
     
     if segmentation:
         print(f"\nMasks (all detections):")
