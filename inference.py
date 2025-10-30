@@ -18,34 +18,42 @@ Options:
                                      Note: COCO JSON (--save-coco) always saves ALL detections with scores,
                                      allowing downstream software to apply its own thresholding
     --model-size=<size>              Model size (nano, small, medium, large) [default: small]
+    --imgz=<size>                    Input image size (images resized to imgz x imgz). If not specified, uses
+                                     resolution from checkpoint
     --device=<device>                Device to run inference on (cpu, cuda, mps, or cuda:0, cuda:1, etc.) [default: cuda]
-    --num-classes=<classes>          Number of classes (required if not using class-names file)
-    --class-names=<path>             Path to class names file (one class per line)
+    --num-classes=<classes>          Number of classes (only required if checkpoint doesn't contain class names)
     --save-txt                       Save detection results as txt files (YOLO format, uses conf-threshold)
     --save-coco                      Save COCO format annotations JSON file (includes ALL detections with scores)
+    --save-masks                     Save per-class masks (combined masks for each class)
+    --save-instances                 Save instance masks (each instance gets unique ID)
     --visualize                      Save visualization images with overlaid masks/boxes (uses conf-threshold)
     --hide-labels                    Hide class labels on bounding boxes in visualization
     --filter-classes=<ids>           Filter by class indices (comma-separated)
     --no-segmentation                Disable segmentation head (detection only)
 
+Note: At least one output option (--save-txt, --save-coco, --save-masks, --save-instances, --visualize) must be specified
+
 Examples:
-    # Save all detections to COCO (downstream processing can filter by score)
-    inference.py images/ model.pth output/ --num-classes=2 --save-coco
+    # Save all detections to COCO (resolution and class names from checkpoint)
+    inference.py images/ model.pth output/ --save-coco
     
     # Visualize only high-confidence detections while saving all to COCO
-    inference.py images/ model.pth output/ --num-classes=2 --visualize --save-coco --conf-threshold=0.7
+    inference.py images/ model.pth output/ --visualize --save-coco --conf-threshold=0.7
     
-    # Using class names file with lower threshold for visualization
-    inference.py images/ model.pth output/ --class-names=classes.txt --visualize --conf-threshold=0.3
+    # Save instance masks and per-class masks with custom resolution
+    inference.py images/ model.pth output/ --save-instances --save-masks --imgz=640
     
     # Save txt labels for high-confidence detections only
-    inference.py images/ model.pth output/ --num-classes=2 --save-txt --conf-threshold=0.6
+    inference.py images/ model.pth output/ --save-txt --conf-threshold=0.6
     
-    # Detection only (no segmentation)
-    inference.py images/ model.pth output/ --num-classes=80 --no-segmentation --visualize
+    # Detection only (no segmentation) - save COCO and visualizations
+    inference.py images/ model.pth output/ --no-segmentation --visualize --save-coco
     
-    # GPU inference with txt output
-    inference.py images/ model.pth output/ --device=cuda:0 --class-names=classes.txt --save-txt
+    # GPU inference with custom resolution and multiple outputs
+    inference.py images/ model.pth output/ --device=cuda:0 --save-txt --save-coco --imgz=640
+    
+    # Higher resolution for better accuracy
+    inference.py images/ model.pth output/ --visualize --imgz=800
 
 """
 
@@ -76,6 +84,10 @@ def load_class_names(class_names_path: Optional[str] = None, num_classes: Option
     """
     Load class names from file or generate default names.
     
+    Supports two file formats:
+    1. Text file with one class name per line
+    2. JSON file with {"class_name": index, ...} pairs
+    
     Args:
         class_names_path: Path to class names file
         num_classes: Number of classes if no file provided
@@ -84,6 +96,43 @@ def load_class_names(class_names_path: Optional[str] = None, num_classes: Option
         Tuple of (class_names_list, num_classes)
     """
     if class_names_path and Path(class_names_path).exists():
+        path = Path(class_names_path)
+        
+        # Try to load as JSON if it has .json extension or if the content is JSON
+        if path.suffix.lower() == '.json':
+            with open(class_names_path, 'r') as f:
+                try:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        # Check if it's a class_name: index dictionary
+                        if all(isinstance(k, str) and isinstance(v, int) for k, v in data.items()):
+                            # Sort by index to create ordered list
+                            max_idx = max(data.values())
+                            class_names = [''] * (max_idx + 1)
+                            for class_name, idx in data.items():
+                                class_names[idx] = class_name
+                            # Check for gaps in indices (would cause misalignment)
+                            if any(name == '' for name in class_names):
+                                missing_indices = [i for i, name in enumerate(class_names) if name == '']
+                                raise ValueError(
+                                    f"JSON class mapping has gaps at indices {missing_indices}. "
+                                    f"Class indices must be contiguous (0, 1, 2, ..., n-1)."
+                                )
+                            
+                            # Check if first class is "background" - RF-DETR doesn't use background class
+                            # Remove it and shift all other classes down by 1
+                            if class_names[0].lower() == 'background':
+                                print(f"Removing 'background' at index 0 - RF-DETR doesn't predict background")
+                                class_names = class_names[1:]  # Remove background
+                                print(f"Shifted class indices down by 1")
+                            
+                            num_classes = len(class_names)
+                            print(f"Loaded {num_classes} class names from JSON file")
+                            return class_names, num_classes
+                except json.JSONDecodeError:
+                    pass  # Fall through to text file handling
+        
+        # Load as text file (one class per line)
         with open(class_names_path, 'r') as f:
             class_names = [line.strip() for line in f.readlines() if line.strip()]
         num_classes = len(class_names)
@@ -298,10 +347,12 @@ def save_combined_masks(
     class_ids: List[int],
     output_dir: Path,
     img_name: str,
-    num_classes: int
+    num_classes: int,
+    save_instances: bool = False,
+    save_classes: bool = False
 ):
     """
-    Save combined instance mask and per-class masks.
+    Save combined instance mask and/or per-class masks.
     
     Args:
         masks: List of binary masks
@@ -309,57 +360,63 @@ def save_combined_masks(
         output_dir: Output directory
         img_name: Base image name (without extension)
         num_classes: Total number of classes
+        save_instances: Whether to save instance masks
+        save_classes: Whether to save per-class masks
     """
-    if not masks:
+    if not masks or (not save_instances and not save_classes):
         return
     
     h, w = masks[0].shape
     
     # Save instance mask (each instance gets unique ID)
-    # Use uint16 to support up to 65535 instances (uint8 only supports 255)
-    instance_mask = np.zeros((h, w), dtype=np.uint16)
-    for i, mask in enumerate(masks):
-        # Ensure mask has correct shape (resize if needed)
-        if mask.shape != (h, w):
-            mask = cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
-            mask = mask.astype(bool) if masks[0].dtype == bool else mask
-        instance_mask[mask > 0] = i + 1
-    
-    instance_path = output_dir / 'instances' / f"{img_name}.png"
-    instance_path.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(instance_path), instance_mask)
+    if save_instances:
+        # Use uint16 to support up to 65535 instances (uint8 only supports 255)
+        instance_mask = np.zeros((h, w), dtype=np.uint16)
+        for i, mask in enumerate(masks):
+            # Ensure mask has correct shape (resize if needed)
+            if mask.shape != (h, w):
+                mask = cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
+                mask = mask.astype(bool) if masks[0].dtype == bool else mask
+            instance_mask[mask > 0] = i + 1
+        
+        instance_path = output_dir / 'instances' / f"{img_name}.png"
+        instance_path.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(instance_path), instance_mask)
     
     # Save per-class masks (all instances of each class combined)
-    classes_dir = output_dir / 'classes'
-    classes_dir.mkdir(parents=True, exist_ok=True)
-    
-    for class_id in range(num_classes):
-        class_mask = np.zeros((h, w), dtype=np.uint8)
+    if save_classes:
+        classes_dir = output_dir / 'classes'
+        classes_dir.mkdir(parents=True, exist_ok=True)
         
-        # Combine all masks for this class
-        for mask, cid in zip(masks, class_ids):
-            if cid == class_id:
-                # Ensure mask has correct shape (resize if needed)
-                if mask.shape != (h, w):
-                    mask = cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
-                    mask = mask.astype(bool) if masks[0].dtype == bool else mask
-                class_mask[mask > 0] = 255
-        
-        class_path = classes_dir / f"{img_name}_class{class_id}.png"
-        cv2.imwrite(str(class_path), class_mask)
+        for class_id in range(num_classes):
+            class_mask = np.zeros((h, w), dtype=np.uint8)
+            
+            # Combine all masks for this class
+            for mask, cid in zip(masks, class_ids):
+                if cid == class_id:
+                    # Ensure mask has correct shape (resize if needed)
+                    if mask.shape != (h, w):
+                        mask = cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
+                        mask = mask.astype(bool) if masks[0].dtype == bool else mask
+                    class_mask[mask > 0] = 255
+            
+            class_path = classes_dir / f"{img_name}_class{class_id}.png"
+            cv2.imwrite(str(class_path), class_mask)
 
 
 def run_inference(
     images_dir: str,
     weights_path: str,
     output_dir: str,
+    imgz: Optional[int] = None,
     model_size: str = 'small',
     conf_threshold: float = 0.5,
     num_classes: Optional[int] = None,
-    class_names_path: Optional[str] = None,
     device: str = 'cpu',
     save_txt: bool = False,
     save_coco: bool = False,
+    save_masks: bool = False,
+    save_instances: bool = False,
     visualize: bool = False,
     hide_labels: bool = False,
     filter_classes: Optional[List[int]] = None,
@@ -372,18 +429,31 @@ def run_inference(
         images_dir: Directory containing input images
         weights_path: Path to trained model weights
         output_dir: Directory to save outputs
+        imgz: Input image size (images resized to imgz x imgz). If None, uses checkpoint resolution
         model_size: Model size (nano, small, medium, large)
         conf_threshold: Confidence threshold for detections
-        num_classes: Number of classes
-        class_names_path: Path to class names file
+        num_classes: Number of classes (only needed if not in checkpoint)
         device: Device to run inference on
         save_txt: Save detection results as txt files
         save_coco: Save COCO format annotations
+        save_masks: Save per-class masks
+        save_instances: Save instance masks
         visualize: Save visualization images
         hide_labels: Hide class labels on bounding boxes
         filter_classes: Filter by specific class indices
         segmentation: Enable segmentation head
     """
+    # Validate that at least one output is specified
+    if not any([save_txt, save_coco, save_masks, save_instances, visualize]):
+        raise ValueError(
+            "No output format specified! You must specify at least one of:\n"
+            "  --save-txt          Save YOLO format text files\n"
+            "  --save-coco         Save COCO JSON annotations\n"
+            "  --save-masks        Save per-class mask images\n"
+            "  --save-instances    Save instance mask images\n"
+            "  --visualize         Save visualization images\n"
+        )
+    
     # Validate inputs
     images_dir = Path(images_dir)
     weights_path = Path(weights_path)
@@ -394,8 +464,48 @@ def run_inference(
     if not weights_path.exists():
         raise FileNotFoundError(f"Weights file not found: {weights_path}")
     
-    # Load class names
-    class_names, num_classes = load_class_names(class_names_path, num_classes)
+    # Try to load class names and resolution from checkpoint
+    checkpoint_class_names = None
+    checkpoint_resolution = None
+    try:
+        checkpoint = torch.load(weights_path, map_location='cpu', weights_only=False)
+        if 'args' in checkpoint:
+            if hasattr(checkpoint['args'], 'class_names'):
+                checkpoint_class_names = checkpoint['args'].class_names
+                print(f"Found class names in checkpoint: {len(checkpoint_class_names)} classes")
+            if hasattr(checkpoint['args'], 'resolution'):
+                checkpoint_resolution = checkpoint['args'].resolution
+                print(f"Found resolution in checkpoint: {checkpoint_resolution}")
+    except Exception as e:
+        print(f"Warning: Could not load data from checkpoint: {e}")
+    
+    # Use checkpoint class names or generate default names
+    if checkpoint_class_names is not None:
+        class_names = checkpoint_class_names
+        num_classes = len(class_names)
+        print(f"Using class names from model checkpoint")
+    elif num_classes is not None:
+        class_names = [f"class_{i}" for i in range(num_classes)]
+        num_classes = num_classes
+        print(f"Using default class names for {num_classes} classes")
+    else:
+        raise ValueError(
+            "Could not determine class names!\n"
+            "  - Checkpoint doesn't contain class names\n"
+            "  - You must provide --num-classes\n"
+        )
+    
+    # Use checkpoint resolution if imgz not specified
+    if imgz is None:
+        if checkpoint_resolution is not None:
+            imgz = checkpoint_resolution
+            print(f"Using resolution from checkpoint: {imgz}")
+        else:
+            raise ValueError(
+                "Could not determine image resolution!\n"
+                "  - Checkpoint doesn't contain resolution\n"
+                "  - You must provide --imgz\n"
+            )
     
     # Create output directories
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -480,11 +590,13 @@ def run_inference(
     
     print("\nLoading model...")
     t_load_start = time.perf_counter()
+    print(f"Using input resolution: {imgz}x{imgz}")
     model = model_class(
         num_classes=num_classes,
         pretrain_weights=str(weights_path),
         segmentation_head=segmentation,
         device=device,
+        resolution=imgz,
     )
     t_load_end = time.perf_counter()
     print(f"Model loaded in {t_load_end - t_load_start:.3f}s")
@@ -659,10 +771,12 @@ def run_inference(
                         txt_lines.append(line)
         
         # Save combined masks
-        if segmentation and masks_list:
+        if segmentation and masks_list and (save_masks or save_instances):
             save_combined_masks(
                 masks_list, class_ids_list, output_dir,
-                img_path.stem, num_classes
+                img_path.stem, num_classes,
+                save_instances=save_instances,
+                save_classes=save_masks
             )
         
         # Save txt file
@@ -748,10 +862,12 @@ def run_inference(
     print(f"  FPS (inference only): {1.0 / np.mean(inference_times):.2f}")
     print(f"{'='*80}")
     
-    if segmentation:
+    if segmentation and (save_instances or save_masks):
         print(f"\nMasks (all detections):")
-        print(f"  Instance masks: {output_dir / 'instances'}")
-        print(f"  Per-class masks: {output_dir / 'classes'}")
+        if save_instances:
+            print(f"  Instance masks: {output_dir / 'instances'}")
+        if save_masks:
+            print(f"  Per-class masks: {output_dir / 'classes'}")
     
     if save_txt:
         print(f"\nLabels (YOLO format, conf >= {conf_threshold}): {labels_dir}")
@@ -776,13 +892,15 @@ def main():
     output_dir = args['<output_dir>']
     
     # Parse options
+    imgz = int(args['--imgz']) if args['--imgz'] else None
     conf_threshold = float(args['--conf-threshold'])
     model_size = args['--model-size']
     device = args['--device']
     num_classes = int(args['--num-classes']) if args['--num-classes'] else None
-    class_names_path = args['--class-names']
     save_txt = args['--save-txt']
     save_coco = args['--save-coco']
+    save_masks = args['--save-masks']
+    save_instances = args['--save-instances']
     visualize = args['--visualize']
     hide_labels = args['--hide-labels']
     segmentation = not args['--no-segmentation']
@@ -796,13 +914,15 @@ def main():
         images_dir=images_dir,
         weights_path=weights_path,
         output_dir=output_dir,
+        imgz=imgz,
         model_size=model_size,
         conf_threshold=conf_threshold,
         num_classes=num_classes,
-        class_names_path=class_names_path,
         device=device,
         save_txt=save_txt,
         save_coco=save_coco,
+        save_masks=save_masks,
+        save_instances=save_instances,
         visualize=visualize,
         hide_labels=hide_labels,
         filter_classes=filter_classes,
