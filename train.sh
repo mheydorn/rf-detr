@@ -1,0 +1,1 @@
+python train_segmentation.py --dataset-dir datasets/onion_defect_coco/ --output-dir output/onion_model_defect_segmentation_oct_7 --batch-size 2 --epochs 50 --num-workers 16 --device cuda:0  --resolution 384 --resume output/onion_model_defect_segmentation_oct_7/checkpoint.pth 

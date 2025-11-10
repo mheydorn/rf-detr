@@ -1,171 +1,346 @@
 # RF-DETR Inference Examples
 
-This document provides examples of how to use the `inference.py` script for running RF-DETR models on your images.
+## Quick Start
 
-## Basic Usage
-
-```bash
-./inference.py <images_dir> <weights_path> <output_dir> [options]
-```
-
-## Examples with Onion Defect Dataset
-
-### 1. Basic Detection Inference
-
-Run detection-only inference (no masks):
+### Example 1: Save COCO Format (Works with All Models)
 ```bash
 python inference.py \
-    datasets/onion_defect_coco/test \
-    rf-detr-small.pth \
-    inference_output \
-    --num-classes=2 \
-    --conf=0.5
+  ~/drive/datasets/test_meat_fm_boxes/images_and_yolo_labels \
+  output/meat_fm_boxes_nov_4_2025/checkpoint_best_ema.pth \
+  results/ \
+  --model-size=medium \
+  --save-coco
 ```
 
-### 2. Segmentation Inference with Visualization
-
-Run segmentation inference with visual output:
+### Example 2: Visualize Detections with Sample Size (Quick Testing)
 ```bash
 python inference.py \
-    datasets/onion_defect_coco/test \
-    output/onion_model_defect_segmentation_oct_7/checkpoint_best_regular.pth \
-    inference_output_seg \
-    --segmentation \
-    --visualize \
-    --class-names=datasets/onion_defect_coco/class_names.txt \
-    --conf=0.3
+  ~/drive/datasets/test_meat_fm_boxes/images_and_yolo_labels \
+  output/meat_fm_boxes_nov_4_2025/checkpoint_best_ema.pth \
+  results/ \
+  --model-size=medium \
+  --visualize \
+  --sample-size=10  # Only process first 10 images
 ```
 
-### 3. Save All Outputs (Masks, COCO, Text, Visualization)
-
-Complete inference with all output formats:
+### Example 3: Save Everything for Segmentation Model
 ```bash
 python inference.py \
-    datasets/onion_defect_coco/test \
-    output/onion_model_defect_segmentation_oct_7/checkpoint_best_regular.pth \
-    inference_output_full \
-    --segmentation \
-    --visualize \
-    --save-txt \
-    --save-conf \
-    --save-coco-labels \
-    --class-names=datasets/onion_defect_coco/class_names.txt \
-    --conf=0.3
+  ~/drive/datasets/test_onion_defect_segmentation_legacy/images \
+  output/onion_model_defect_segmentation_oct_7/checkpoint_best_ema.pth \
+  results/ \
+  --model-size=small \
+  --save-coco \
+  --save-txt \
+  --save-masks \
+  --save-instances \
+  --visualize \
+  --sample-size=20
 ```
 
-### 4. GPU Inference
-
-Run on CUDA GPU:
+### Example 4: Detection Model Only
 ```bash
 python inference.py \
-    datasets/onion_defect_coco/test \
-    output/onion_model_defect_segmentation_oct_7/checkpoint_best_regular.pth \
-    inference_output_gpu \
-    --segmentation \
-    --visualize \
-    --device=cuda:0 \
-    --class-names=datasets/onion_defect_coco/class_names.txt
+  ~/drive/datasets/test_meat_fm_boxes/images_and_yolo_labels \
+  output/meat_fm_boxes_nov_4_2025/checkpoint_best_ema.pth \
+  results/ \
+  --model-size=medium \
+  --save-coco \
+  --save-txt \
+  --visualize
 ```
 
-### 5. Filter Specific Classes
+## Key Features
 
-Only detect specific classes (e.g., only class 0 - mechanical_damage):
+### 1. Automatic Model Type Detection
+The script automatically detects whether your model is:
+- **Segmentation model**: Has segmentation head for instance segmentation
+- **Detection-only model**: Only outputs bounding boxes
+
+No need to specify anything - the script reads this from the checkpoint!
+
+### 2. Sample Size for Testing
+Use `--sample-size=N` to process only the first N images. This is perfect for:
+- Quick testing without waiting for full dataset
+- Testing on specific sample before full run
+- Debugging issues
+
+Example:
 ```bash
-python inference.py \
-    datasets/onion_defect_coco/test \
-    output/onion_model_defect_segmentation_oct_7/checkpoint_best_regular.pth \
-    inference_output_filtered \
-    --segmentation \
-    --visualize \
-    --filter-classes=0 \
-    --class-names=datasets/onion_defect_coco/class_names.txt \
-    --conf=0.25
+python inference.py images/ model.pth output/ --save-coco --sample-size=10
 ```
 
-### 6. Inference on a Subset of Images
+### 3. COCO Format Works for Both Models
+**Detection-only model output:**
+```json
+{
+  "id": 1,
+  "image_id": 1,
+  "category_id": 0,
+  "bbox": [100, 50, 200, 150],
+  "area": 30000,
+  "score": 0.95,
+  "iscrowd": 0
+}
+```
 
-Create a temporary directory with a few test images:
+**Segmentation model output (includes segmentation):**
+```json
+{
+  "id": 1,
+  "image_id": 1,
+  "category_id": 0,
+  "bbox": [100, 50, 200, 150],
+  "area": 25000,
+  "score": 0.95,
+  "segmentation": [[100, 50, 200, 50, 200, 200, ...]],
+  "iscrowd": 0
+}
+```
+
+### 4. Text Output (YOLO Format)
+Works for both model types:
+
+**Segmentation model**: Uses precise mask polygon
+```
+0 0.1 0.05 0.3 0.05 0.3 0.2 0.1 0.2
+```
+
+**Detection model**: Converts bbox to 4-corner polygon
+```
+0 0.1 0.05 0.3 0.05 0.3 0.2 0.1 0.2
+```
+
+### 5. Visualization
+Works for both model types:
+
+**Segmentation model**: Shows masks, boxes, and labels
 ```bash
-mkdir -p test_images
-cp datasets/onion_defect_coco/test/2023-01-25-21-48-09.528215_SVW-C8E447_34_run.png test_images/
-cp datasets/onion_defect_coco/test/2023-01-25-21-48-10.278337_SVW-C8E447_20_run.png test_images/
+python inference.py images/ seg_model.pth output/ --visualize
+```
 
-python inference.py \
-    test_images \
-    output/onion_model_defect_segmentation_oct_7/checkpoint_best_regular.pth \
-    quick_test_output \
-    --segmentation \
-    --visualize \
-    --class-names=datasets/onion_defect_coco/class_names.txt
+**Detection model**: Shows only boxes and labels (no masks)
+```bash
+python inference.py images/ det_model.pth output/ --visualize
+```
+
+### 6. Error Protection
+Segmentation-specific options are protected:
+
+```bash
+# This will FAIL with detection-only model:
+python inference.py images/ det_model.pth output/ --save-masks
+# Error: ERROR: --save-masks is only available for segmentation models!
+
+# This will FAIL with detection-only model:
+python inference.py images/ det_model.pth output/ --save-instances
+# Error: ERROR: --save-instances is only available for segmentation models!
 ```
 
 ## Output Structure
 
-After running inference, your output directory will contain:
-
+### Detection-Only Model Results
 ```
-output_dir/
-├── masks/                      # Individual mask images (PNG)
-│   ├── image1.png
-│   ├── image2.png
-│   └── ...
-├── labels/                     # Text files with segmentation polygons
+output/
+├── coco_annotations.json    # All detections with scores
+├── labels/                   # YOLO format txt files (optional)
 │   ├── image1.txt
-│   ├── image2.txt
-│   └── ...
-├── visualizations/            # Annotated images with overlaid masks/boxes
-│   ├── image1_vis.png
-│   ├── image2_vis.png
-│   └── ...
-└── coco_annotations.json      # COCO format annotations (if --save-coco-labels)
+│   └── image2.txt
+└── visualizations/           # PNG images with boxes (optional)
+    ├── image1_vis.png
+    └── image2_vis.png
 ```
 
-## Command-Line Options
+### Segmentation Model Results
+```
+output/
+├── coco_annotations.json    # All detections with scores and masks
+├── labels/                   # YOLO format txt files (optional)
+├── visualizations/           # PNG images with masks and boxes (optional)
+├── instances/                # Instance masks (optional)
+│   ├── image1.png
+│   └── image2.png
+└── classes/                  # Per-class combined masks (optional)
+    ├── image1_class0.png
+    ├── image1_class1.png
+    └── ...
+```
 
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--conf=<conf>` | Confidence threshold | 0.5 |
-| `--model-size=<size>` | Model size (nano, small, medium, large) | small |
-| `--device=<device>` | Device (cpu, cuda, mps, cuda:0, etc.) | cpu |
-| `--num-classes=<n>` | Number of classes | (required if no class-names) |
-| `--class-names=<path>` | Path to class names file | (optional) |
-| `--save-txt` | Save segmentation polygons as text | false |
-| `--save-conf` | Include confidence scores in text output | false |
-| `--save-coco-labels` | Save COCO format JSON | false |
-| `--visualize` | Save visualization images | false |
-| `--hide-labels` | Hide labels on visualization | false |
-| `--filter-classes=<ids>` | Filter by class IDs (comma-separated) | (none) |
-| `--segmentation` | Enable segmentation head | false |
+## Common Workflows
 
-## Tips
+### Workflow 1: Batch Process Many Images with COCO Output
+```bash
+python inference.py \
+  large_dataset/ \
+  model.pth \
+  output/ \
+  --save-coco \
+  --device=cuda:0
+```
 
-1. **Lower confidence threshold** if you're missing detections: `--conf=0.25`
-2. **Use GPU** for faster inference on large image batches: `--device=cuda:0`
-3. **Save COCO format** for easy evaluation: `--save-coco-labels`
-4. **Filter classes** to focus on specific defect types: `--filter-classes=0,1`
-5. **Use class names file** for better visualization labels: `--class-names=path/to/class_names.txt`
+### Workflow 2: Quick Test with 10 Images
+```bash
+python inference.py \
+  large_dataset/ \
+  model.pth \
+  output/ \
+  --visualize \
+  --save-coco \
+  --sample-size=10 \
+  --device=cpu
+```
 
-## Comparison to YOLO Reference
+### Workflow 3: Full Segmentation Analysis
+```bash
+python inference.py \
+  dataset/ \
+  seg_model.pth \
+  output/ \
+  --save-coco \
+  --save-txt \
+  --save-masks \
+  --save-instances \
+  --visualize \
+  --conf-threshold=0.5 \
+  --device=cuda:0
+```
 
-The RF-DETR inference script follows a similar CLI pattern to the YOLO reference script:
+### Workflow 4: Detection Analysis with Multiple Confidence Levels
+```bash
+# High confidence detections only
+python inference.py \
+  dataset/ \
+  det_model.pth \
+  output_high/ \
+  --save-coco \
+  --visualize \
+  --conf-threshold=0.8
 
-**Similar:**
-- Same argument structure: `<images_dir> <weights_path> <output_dir>`
-- Similar options: `--conf`, `--device`, `--visualize`, `--save-txt`, `--save-coco-labels`
-- Same output directory structure
+# All detections (stored in COCO, filtered by score downstream)
+python inference.py \
+  dataset/ \
+  det_model.pth \
+  output_all/ \
+  --save-coco
+```
 
-**Different:**
-- RF-DETR uses `--model-size` instead of auto-detecting from weights
-- RF-DETR requires `--segmentation` flag for segmentation models
-- RF-DETR uses `--class-names` or `--num-classes` instead of auto-detecting
-- RF-DETR uses `--filter-classes` instead of `--classes`
-- No `--iou` or `--imgsz` options (RF-DETR handles these internally)
-- Omitted YOLO-specific output format options
+## Tips and Tricks
 
-## Performance Notes
+### 1. Test with Small Sample First
+Always start with `--sample-size=5` to verify everything works:
+```bash
+python inference.py images/ model.pth output/ --visualize --sample-size=5
+```
 
-- **CPU inference**: Expect ~500ms-2s per image depending on image size
-- **GPU inference**: Expect ~50-200ms per image (after warmup)
-- **Batch processing**: The script processes images sequentially; for large batches, GPU is recommended
+### 2. Filter by Confidence in COCO
+The COCO JSON contains all detections with scores. Filter downstream:
+```python
+import json
+with open('coco_annotations.json') as f:
+    data = json.load(f)
+    
+# High confidence only
+high_conf = [a for a in data['annotations'] if a['score'] >= 0.8]
+```
 
+### 3. Use GPU for Speed
+Default is CPU. For faster processing use GPU:
+```bash
+python inference.py ... --device=cuda:0  # GPU 0
+python inference.py ... --device=cuda:1  # GPU 1
+```
+
+### 4. Process Multiple Models Sequentially
+```bash
+for model in model1.pth model2.pth model3.pth; do
+  python inference.py images/ $model output_$model/ --save-coco --sample-size=10
+done
+```
+
+### 5. Check Model Type Before Processing
+```python
+# Quick check without running inference
+import torch
+checkpoint = torch.load('model.pth', map_location='cpu', weights_only=False)
+is_seg = checkpoint['args'].segmentation_head
+print(f"Model type: {'Segmentation' if is_seg else 'Detection-only'}")
+```
+
+## Troubleshooting
+
+### Issue: "Model type: Detection-only" but I expected segmentation
+**Solution**: The model was trained with `--no-segmentation` or `segmentation_head=False`. Check checkpoint:
+```python
+checkpoint = torch.load('model.pth', map_location='cpu', weights_only=False)
+print(checkpoint['args'].segmentation_head)
+```
+
+### Issue: --save-masks gives error with my model
+**Solution**: Your model is detection-only. Use `--visualize` instead to see boxes:
+```bash
+python inference.py images/ model.pth output/ --visualize --save-coco
+```
+
+### Issue: Processing is slow
+**Solution**: Use GPU and/or reduce sample size:
+```bash
+# Use GPU
+python inference.py images/ model.pth output/ --device=cuda:0 --save-coco
+
+# Or just process subset
+python inference.py images/ model.pth output/ --save-coco --sample-size=100
+```
+
+### Issue: COCO JSON is huge
+**Solution**: This is expected - COCO includes all detections. Filter by score downstream:
+```python
+high_conf_only = [a for a in data['annotations'] if a['score'] >= 0.7]
+```
+
+## Performance Reference
+
+### Detection-Only Model (meat_fm_boxes, CPU)
+- Model loading: ~0.9s
+- Per-image: ~2.5s
+- Throughput: ~0.4 images/second
+
+### Segmentation Model (onion_defect, CPU)
+- Model loading: ~0.9s
+- Per-image: ~0.2s
+- Throughput: ~4.5 images/second
+
+**Note**: Much faster on GPU! Use `--device=cuda:0` for production.
+
+## Advanced Usage
+
+### Custom Class Filtering
+Process only specific classes:
+```bash
+python inference.py images/ model.pth output/ \
+  --save-coco \
+  --filter-classes=0,2  # Only classes 0 and 2
+```
+
+### Hide Labels in Visualization
+Remove class labels from visualization images:
+```bash
+python inference.py images/ model.pth output/ \
+  --visualize \
+  --hide-labels
+```
+
+### Different Confidence Thresholds
+```bash
+# For visualization/txt output (conf threshold)
+--conf-threshold=0.8
+
+# Note: COCO always saves all detections regardless of threshold
+```
+
+## Related Files
+
+- `inference.py` - Main inference script
+- `TEST_INFERENCE.md` - Comprehensive test results
+- `rfdetr/` - RF-DETR model code
+- `output/` - Trained model checkpoints
 

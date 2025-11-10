@@ -18,18 +18,19 @@ Options:
                                      Note: COCO JSON (--save-coco) always saves ALL detections with scores,
                                      allowing downstream software to apply its own thresholding
     --model-size=<size>              Model size (nano, small, medium, large) [default: small]
-    --imgz=<size>                    Input image size (images resized to imgz x imgz). If not specified, uses
-                                     resolution from checkpoint
     --device=<device>                Device to run inference on (cpu, cuda, mps, or cuda:0, cuda:1, etc.) [default: cuda]
     --num-classes=<classes>          Number of classes (only required if checkpoint doesn't contain class names)
+    --sample-size=<n>                If specified, only process first N images (useful for testing)
     --save-txt                       Save detection results as txt files (YOLO format, uses conf-threshold)
     --save-coco                      Save COCO format annotations JSON file (includes ALL detections with scores)
-    --save-masks                     Save per-class masks (combined masks for each class)
-    --save-instances                 Save instance masks (each instance gets unique ID)
+    --save-masks                     Save per-class masks (combined masks for each class, segmentation only)
+    --save-instances                 Save instance masks (each instance gets unique ID, segmentation only)
     --visualize                      Save visualization images with overlaid masks/boxes (uses conf-threshold)
     --hide-labels                    Hide class labels on bounding boxes in visualization
     --filter-classes=<ids>           Filter by class indices (comma-separated)
     --no-segmentation                Disable segmentation head (detection only)
+
+Note: Image resolution is automatically loaded from the checkpoint file.
 
 Note: At least one output option (--save-txt, --save-coco, --save-masks, --save-instances, --visualize) must be specified
 
@@ -40,8 +41,8 @@ Examples:
     # Visualize only high-confidence detections while saving all to COCO
     inference.py images/ model.pth output/ --visualize --save-coco --conf-threshold=0.7
     
-    # Save instance masks and per-class masks with custom resolution
-    inference.py images/ model.pth output/ --save-instances --save-masks --imgz=640
+    # Save instance masks and per-class masks
+    inference.py images/ model.pth output/ --save-instances --save-masks
     
     # Save txt labels for high-confidence detections only
     inference.py images/ model.pth output/ --save-txt --conf-threshold=0.6
@@ -49,11 +50,8 @@ Examples:
     # Detection only (no segmentation) - save COCO and visualizations
     inference.py images/ model.pth output/ --no-segmentation --visualize --save-coco
     
-    # GPU inference with custom resolution and multiple outputs
-    inference.py images/ model.pth output/ --device=cuda:0 --save-txt --save-coco --imgz=640
-    
-    # Higher resolution for better accuracy
-    inference.py images/ model.pth output/ --visualize --imgz=800
+    # GPU inference with multiple outputs
+    inference.py images/ model.pth output/ --device=cuda:0 --save-txt --save-coco
 
 """
 
@@ -70,6 +68,7 @@ from datetime import datetime
 from PIL import Image
 from typing import List, Optional, Tuple
 import supervision as sv
+from tqdm import tqdm
 
 # Import RF-DETR models
 try:
@@ -78,6 +77,48 @@ except ImportError as e:
     print(f"Error importing RF-DETR modules: {e}")
     print("Make sure RF-DETR is installed: pip install -e .")
     sys.exit(1)
+
+
+def detect_model_has_segmentation(weights_path: str) -> bool:
+    """
+    Detect if a model checkpoint has segmentation capability.
+    
+    Checks the checkpoint args for segmentation_head flag. This is the most
+    reliable indicator of whether a model was trained with segmentation.
+    
+    Args:
+        weights_path: Path to checkpoint file
+        
+    Returns:
+        True if model has segmentation head, False if detection-only
+    """
+    try:
+        checkpoint = torch.load(weights_path, map_location='cpu', weights_only=False)
+        
+        # Check args for segmentation flag (most reliable)
+        if 'args' in checkpoint:
+            args = checkpoint['args']
+            if hasattr(args, 'segmentation_head'):
+                has_seg = args.segmentation_head
+                return has_seg
+        
+        # Fallback: check if model state dict contains segmentation head parameters
+        # Look for decoder.mask_head or similar segmentation-specific layers
+        if 'model' in checkpoint:
+            state_dict = checkpoint['model']
+            # Look for decoder.mask_head or segmentation head parameters
+            seg_keys = [k for k in state_dict.keys() if 'mask_head' in k.lower() or 
+                       ('decoder' in k and 'mask' in k.lower() and 'token' not in k.lower())]
+            if seg_keys:
+                return True
+        
+        # Default to True for backward compatibility (assume older models have segmentation)
+        return True
+        
+    except Exception as e:
+        print(f"Warning: Could not determine if model has segmentation head: {e}")
+        print("Assuming model has segmentation capability")
+        return True
 
 
 def load_class_names(class_names_path: Optional[str] = None, num_classes: Optional[int] = None) -> Tuple[List[str], int]:
@@ -408,7 +449,6 @@ def run_inference(
     images_dir: str,
     weights_path: str,
     output_dir: str,
-    imgz: Optional[int] = None,
     model_size: str = 'small',
     conf_threshold: float = 0.5,
     num_classes: Optional[int] = None,
@@ -420,16 +460,18 @@ def run_inference(
     visualize: bool = False,
     hide_labels: bool = False,
     filter_classes: Optional[List[int]] = None,
-    segmentation: bool = True,
+    segmentation: Optional[bool] = None,
+    sample_size: Optional[int] = None,
 ):
     """
     Run RF-DETR inference on a directory of images.
     
+    Image resolution is automatically loaded from checkpoint.
+    
     Args:
         images_dir: Directory containing input images
-        weights_path: Path to trained model weights
+        weights_path: Path to trained model weights (must contain resolution)
         output_dir: Directory to save outputs
-        imgz: Input image size (images resized to imgz x imgz). If None, uses checkpoint resolution
         model_size: Model size (nano, small, medium, large)
         conf_threshold: Confidence threshold for detections
         num_classes: Number of classes (only needed if not in checkpoint)
@@ -441,7 +483,8 @@ def run_inference(
         visualize: Save visualization images
         hide_labels: Hide class labels on bounding boxes
         filter_classes: Filter by specific class indices
-        segmentation: Enable segmentation head
+        segmentation: Enable segmentation head (auto-detected if None)
+        sample_size: If specified, only process first N images
     """
     # Validate that at least one output is specified
     if not any([save_txt, save_coco, save_masks, save_instances, visualize]):
@@ -463,6 +506,28 @@ def run_inference(
         raise FileNotFoundError(f"Images directory not found: {images_dir}")
     if not weights_path.exists():
         raise FileNotFoundError(f"Weights file not found: {weights_path}")
+    
+    # Auto-detect segmentation capability from checkpoint if not explicitly specified
+    if segmentation is None:
+        print("Auto-detecting segmentation capability from checkpoint...")
+        has_segmentation = detect_model_has_segmentation(str(weights_path))
+        segmentation = has_segmentation
+        print(f"Model type: {'Segmentation' if segmentation else 'Detection-only'}")
+    
+    # Validate that segmentation-only options are not used with detection-only models
+    if not segmentation:
+        if save_masks:
+            raise ValueError(
+                "ERROR: --save-masks is only available for segmentation models!\n"
+                f"The checkpoint '{weights_path.name}' is a detection-only model.\n"
+                "Remove --save-masks to proceed with detection-only inference."
+            )
+        if save_instances:
+            raise ValueError(
+                "ERROR: --save-instances is only available for segmentation models!\n"
+                f"The checkpoint '{weights_path.name}' is a detection-only model.\n"
+                "Remove --save-instances to proceed with detection-only inference."
+            )
     
     # Try to load class names and resolution from checkpoint
     checkpoint_class_names = None
@@ -495,17 +560,14 @@ def run_inference(
             "  - You must provide --num-classes\n"
         )
     
-    # Use checkpoint resolution if imgz not specified
-    if imgz is None:
-        if checkpoint_resolution is not None:
-            imgz = checkpoint_resolution
-            print(f"Using resolution from checkpoint: {imgz}")
-        else:
-            raise ValueError(
-                "Could not determine image resolution!\n"
-                "  - Checkpoint doesn't contain resolution\n"
-                "  - You must provide --imgz\n"
-            )
+    # Use checkpoint resolution (required)
+    if checkpoint_resolution is None:
+        raise ValueError(
+            "Could not determine image resolution!\n"
+            "  - Checkpoint doesn't contain resolution\n"
+        )
+    imgz = checkpoint_resolution
+    print(f"Using resolution from checkpoint: {imgz}")
     
     # Create output directories
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -623,220 +685,241 @@ def run_inference(
     if not image_paths:
         raise FileNotFoundError(f"No images found in {images_dir}")
     
-    print(f"\nFound {len(image_paths)} images")
+    # Apply sample size if specified
+    total_images = len(image_paths)
+    if sample_size is not None and sample_size > 0:
+        image_paths = image_paths[:sample_size]
+        print(f"\nFound {total_images} images, using sample size: {len(image_paths)} images")
+    else:
+        print(f"\nFound {len(image_paths)} images")
     print(f"\n{'='*80}")
     print("Running inference...")
     print(f"{'='*80}\n")
-    
+
     annotation_id = 1
     image_id = 1
-    
+
     total_detections = 0
-    
+
     # Timing statistics
     image_load_times = []
     inference_times = []
     postprocess_times = []
     total_times = []
-    
+
     t_total_start = time.perf_counter()
-    
-    # Process each image
-    for img_path in image_paths:
-        t_img_start = time.perf_counter()
-        print(f"Processing: {img_path.name}")
-        
-        # Load image
-        t_load_start = time.perf_counter()
-        image = Image.open(img_path).convert('RGB')
-        img_width, img_height = image.size
-        t_load_end = time.perf_counter()
-        image_load_times.append(t_load_end - t_load_start)
-        
-        # Run inference with very low threshold to get ALL detections
-        # This ensures COCO output contains all predictions with scores
-        t_infer_start = time.perf_counter()
-        all_detections = model.predict(image, threshold=0.01)
-        t_infer_end = time.perf_counter()
-        inference_times.append(t_infer_end - t_infer_start)
-        print(f"  Inference time: {t_infer_end - t_infer_start:.3f}s")
-        
-        # Create mapping from model's category IDs to class indices
-        # This handles cases where training data used non-zero-indexed categories (e.g., 1, 2 instead of 0, 1)
-        category_mapping = create_category_mapping(all_detections, num_classes)
-        
-        # Filter by class if specified (after mapping)
-        if filter_classes is not None and len(all_detections) > 0:
-            # Map filter_classes to original category IDs for filtering
-            reverse_mapping = {v: k for k, v in category_mapping.items()}
-            filter_cats = [reverse_mapping.get(c, c) for c in filter_classes]
-            mask = np.isin(all_detections.class_id, filter_cats)
-            all_detections = all_detections[mask]
-        
-        # Show category mapping if detections present
-        if len(all_detections) > 0 and image_id == 1:  # Only show once
-            unique_cats = np.unique(all_detections.class_id)
-            print(f"  Category ID mapping: {', '.join([f'{cat}->{category_mapping.get(cat, cat)}' for cat in sorted(unique_cats)])}")
-        
-        # Create filtered detections for visualization and txt output
-        if len(all_detections) > 0:
-            conf_mask = all_detections.confidence >= conf_threshold
-            filtered_detections = all_detections[conf_mask]
-        else:
-            filtered_detections = all_detections
-        
-        num_all_detections = len(all_detections)
-        num_filtered_detections = len(filtered_detections)
-        total_detections += num_all_detections
-        
-        print(f"  All detections: {num_all_detections}")
-        if num_filtered_detections < num_all_detections:
-            print(f"  Above threshold ({conf_threshold}): {num_filtered_detections}")
-        
-        # Add image info to COCO
-        if save_coco:
-            coco_data["images"].append({
-                "id": image_id,
-                "file_name": img_path.name,
-                "width": int(img_width),
-                "height": int(img_height)
-            })
-        
-        # Process ALL detections for COCO output and mask saving
-        t_postprocess_start = time.perf_counter()
-        txt_lines = []
-        masks_list = []
-        class_ids_list = []
-        
-        # Process all detections for COCO output
-        if num_all_detections > 0:
-            all_boxes = all_detections.xyxy
-            all_confidences = all_detections.confidence
-            all_class_ids_raw = all_detections.class_id  # Raw category IDs from model
-            all_masks = all_detections.mask if segmentation and all_detections.mask is not None else None
-            
-            if segmentation and all_masks is not None:
-                print(f"  Masks: {all_masks.shape}")
-            
-            # Process each detection for COCO and mask output
-            for i in range(num_all_detections):
-                category_id = int(all_class_ids_raw[i])  # Original category ID from model
-                class_id = category_mapping.get(category_id, category_id)  # Mapped to class index
-                confidence = float(all_confidences[i])
-                box = all_boxes[i]
-                mask = all_masks[i] if all_masks is not None else None
-                
-                # Store mask for combined output (using mapped class_id)
-                if mask is not None:
-                    masks_list.append(mask)
-                    class_ids_list.append(class_id)
-                
-                # Convert mask to polygon
-                polygon = None
-                if mask is not None:
-                    polygon = mask_to_polygon(mask)
-                    if polygon is None and save_coco:
-                        print(f"    Warning: Failed to convert mask {i} to polygon")
-                
-                # Add COCO annotation (always saves all detections with scores)
-                if save_coco:
-                    annotation = create_coco_annotation(
-                        annotation_id, image_id, class_id,
-                        box, confidence, polygon, mask
-                    )
-                    coco_data["annotations"].append(annotation)
-                    annotation_id += 1
-        
-        # Process filtered detections for txt output (only above threshold)
-        if save_txt and num_filtered_detections > 0:
-            filt_boxes = filtered_detections.xyxy
-            filt_confidences = filtered_detections.confidence
-            filt_class_ids_raw = filtered_detections.class_id
-            filt_masks = filtered_detections.mask if segmentation and filtered_detections.mask is not None else None
-            
-            for i in range(num_filtered_detections):
-                category_id = int(filt_class_ids_raw[i])
-                class_id = category_mapping.get(category_id, category_id)
-                confidence = float(filt_confidences[i])
-                mask = filt_masks[i] if filt_masks is not None else None
-                
-                # Convert mask to polygon
-                if mask is not None:
-                    polygon = mask_to_polygon(mask)
-                    if polygon is not None:
+
+    # Process each image with progress bar
+    with tqdm(total=len(image_paths), desc="Processing images", unit="img") as pbar:
+        for img_path in image_paths:
+            t_img_start = time.perf_counter()
+
+            # Load image
+            t_load_start = time.perf_counter()
+            try:
+                image = Image.open(img_path).convert('RGB')
+                img_width, img_height = image.size
+            except Exception as e:
+                pbar.set_postfix_str(f"Skipped {img_path.name}: {e}")
+                pbar.update(1)
+                continue
+            t_load_end = time.perf_counter()
+            image_load_times.append(t_load_end - t_load_start)
+
+            # Run inference with very low threshold to get ALL detections
+            # This ensures COCO output contains all predictions with scores
+            t_infer_start = time.perf_counter()
+            all_detections = model.predict(image, threshold=0.01)
+            t_infer_end = time.perf_counter()
+            inference_times.append(t_infer_end - t_infer_start)
+
+            # Create mapping from model's category IDs to class indices
+            # This handles cases where training data used non-zero-indexed categories (e.g., 1, 2 instead of 0, 1)
+            category_mapping = create_category_mapping(all_detections, num_classes)
+
+            # Filter by class if specified (after mapping)
+            if filter_classes is not None and len(all_detections) > 0:
+                # Map filter_classes to original category IDs for filtering
+                reverse_mapping = {v: k for k, v in category_mapping.items()}
+                filter_cats = [reverse_mapping.get(c, c) for c in filter_classes]
+                mask = np.isin(all_detections.class_id, filter_cats)
+                all_detections = all_detections[mask]
+
+            # Show category mapping if detections present
+            if len(all_detections) > 0 and image_id == 1:  # Only show once
+                unique_cats = np.unique(all_detections.class_id)
+                print(f"Category ID mapping: {', '.join([f'{cat}->{category_mapping.get(cat, cat)}' for cat in sorted(unique_cats)])}")
+
+            # Create filtered detections for visualization and txt output
+            if len(all_detections) > 0:
+                conf_mask = all_detections.confidence >= conf_threshold
+                filtered_detections = all_detections[conf_mask]
+            else:
+                filtered_detections = all_detections
+
+            num_all_detections = len(all_detections)
+            num_filtered_detections = len(filtered_detections)
+            total_detections += num_all_detections
+
+            # Add image info to COCO
+            if save_coco:
+                coco_data["images"].append({
+                    "id": image_id,
+                    "file_name": img_path.name,
+                    "width": int(img_width),
+                    "height": int(img_height)
+                })
+
+            # Process ALL detections for COCO output and mask saving
+            t_postprocess_start = time.perf_counter()
+            txt_lines = []
+            masks_list = []
+            class_ids_list = []
+
+            # Process all detections for COCO output
+            if num_all_detections > 0:
+                all_boxes = all_detections.xyxy
+                all_confidences = all_detections.confidence
+                all_class_ids_raw = all_detections.class_id  # Raw category IDs from model
+                all_masks = all_detections.mask if segmentation and all_detections.mask is not None else None
+
+                # Process each detection for COCO and mask output
+                for i in range(num_all_detections):
+                    category_id = int(all_class_ids_raw[i])  # Original category ID from model
+                    class_id = category_mapping.get(category_id, category_id)  # Mapped to class index
+                    confidence = float(all_confidences[i])
+                    box = all_boxes[i]
+                    mask = all_masks[i] if all_masks is not None else None
+
+                    # Store mask for combined output (using mapped class_id)
+                    if mask is not None:
+                        masks_list.append(mask)
+                        class_ids_list.append(class_id)
+
+                    # Convert mask to polygon
+                    polygon = None
+                    if mask is not None:
+                        polygon = mask_to_polygon(mask)
+
+                    # Add COCO annotation (always saves all detections with scores)
+                    if save_coco:
+                        annotation = create_coco_annotation(
+                            annotation_id, image_id, class_id,
+                            box, confidence, polygon, mask
+                        )
+                        coco_data["annotations"].append(annotation)
+                        annotation_id += 1
+
+            # Process filtered detections for txt output (only above threshold)
+            if save_txt and num_filtered_detections > 0:
+                filt_boxes = filtered_detections.xyxy
+                filt_confidences = filtered_detections.confidence
+                filt_class_ids_raw = filtered_detections.class_id
+                filt_masks = filtered_detections.mask if segmentation and filtered_detections.mask is not None else None
+
+                for i in range(num_filtered_detections):
+                    category_id = int(filt_class_ids_raw[i])
+                    class_id = category_mapping.get(category_id, category_id)
+                    confidence = float(filt_confidences[i])
+                    mask = filt_masks[i] if filt_masks is not None else None
+                    box = filt_boxes[i]
+
+                    # For segmentation models, try to use polygon from mask
+                    # For detection-only models, convert bbox to YOLO polygon format
+                    if mask is not None:
+                        # Segmentation model - use mask polygon
+                        polygon = mask_to_polygon(mask)
+                        if polygon is not None:
+                            line = save_txt_detection(
+                                class_id, polygon, confidence,
+                                img_width, img_height, save_conf=True
+                            )
+                            txt_lines.append(line)
+                    elif not segmentation:
+                        # Detection-only model - convert bbox to polygon format
+                        x1, y1, x2, y2 = box
+                        # Create polygon as bbox corners in normalized coordinates
+                        polygon = [x1, y1, x2, y1, x2, y2, x1, y2]
                         line = save_txt_detection(
                             class_id, polygon, confidence,
                             img_width, img_height, save_conf=True
                         )
                         txt_lines.append(line)
-        
-        # Save combined masks
-        if segmentation and masks_list and (save_masks or save_instances):
-            save_combined_masks(
-                masks_list, class_ids_list, output_dir,
-                img_path.stem, num_classes,
-                save_instances=save_instances,
-                save_classes=save_masks
-            )
-        
-        # Save txt file
-        if save_txt and txt_lines:
-            txt_path = labels_dir / f"{img_path.stem}.txt"
-            with open(txt_path, 'w') as f:
-                f.write('\n'.join(txt_lines))
-        
-        # Save visualization (only shows detections above threshold)
-        if visualize and num_filtered_detections > 0:
-            image_np = np.array(image)
-            
-            # Get filtered detection data for visualization
-            filt_class_ids_raw = filtered_detections.class_id
-            filt_confidences = filtered_detections.confidence
-            filt_masks = filtered_detections.mask if segmentation and filtered_detections.mask is not None else None
-            
-            # Create annotated image
-            if segmentation and filt_masks is not None:
-                mask_annotator = sv.MaskAnnotator()
-                image_np = mask_annotator.annotate(image_np, filtered_detections)
-            
-            box_annotator = sv.BoxAnnotator()
-            image_np = box_annotator.annotate(image_np, filtered_detections)
-            
-            if not hide_labels:
-                labels = []
-                for category_id, conf in zip(filt_class_ids_raw, filt_confidences):
-                    # Map category ID to class index for label lookup
-                    class_id = category_mapping.get(category_id, category_id)
-                    if 0 <= class_id < len(class_names):
-                        labels.append(f"{class_names[class_id]} {conf:.2f}")
-                    else:
-                        labels.append(f"class_{class_id} {conf:.2f}")
-                
-                label_annotator = sv.LabelAnnotator()
-                image_np = label_annotator.annotate(image_np, filtered_detections, labels)
-            
-            vis_path = vis_dir / f"{img_path.stem}_vis.png"
-            Image.fromarray(image_np).save(str(vis_path))
-        
-        t_postprocess_end = time.perf_counter()
-        t_img_end = time.perf_counter()
-        
-        postprocess_times.append(t_postprocess_end - t_postprocess_start)
-        total_times.append(t_img_end - t_img_start)
-        
-        print(f"  Postprocessing time: {t_postprocess_end - t_postprocess_start:.3f}s")
-        print(f"  Total image time: {t_img_end - t_img_start:.3f}s")
-        
-        image_id += 1
+
+            # Save combined masks
+            if segmentation and masks_list and (save_masks or save_instances):
+                save_combined_masks(
+                    masks_list, class_ids_list, output_dir,
+                    img_path.stem, num_classes,
+                    save_instances=save_instances,
+                    save_classes=save_masks
+                )
+
+            # Save txt file
+            if save_txt and txt_lines:
+                txt_path = labels_dir / f"{img_path.stem}.txt"
+                with open(txt_path, 'w') as f:
+                    f.write('\n'.join(txt_lines))
+
+            # Save visualization (only shows detections above threshold)
+            if visualize and num_filtered_detections > 0:
+                image_np = np.array(image)
+
+                # Get filtered detection data for visualization
+                filt_class_ids_raw = filtered_detections.class_id
+                filt_confidences = filtered_detections.confidence
+                filt_masks = filtered_detections.mask if segmentation and filtered_detections.mask is not None else None
+
+                # Create annotated image
+                if segmentation and filt_masks is not None:
+                    mask_annotator = sv.MaskAnnotator()
+                    image_np = mask_annotator.annotate(image_np, filtered_detections)
+
+                box_annotator = sv.BoxAnnotator()
+                image_np = box_annotator.annotate(image_np, filtered_detections)
+
+                if not hide_labels:
+                    labels = []
+                    for category_id, conf in zip(filt_class_ids_raw, filt_confidences):
+                        # Map category ID to class index for label lookup
+                        class_id = category_mapping.get(category_id, category_id)
+                        if 0 <= class_id < len(class_names):
+                            labels.append(f"{class_names[class_id]} {conf:.2f}")
+                        else:
+                            labels.append(f"class_{class_id} {conf:.2f}")
+
+                    label_annotator = sv.LabelAnnotator()
+                    image_np = label_annotator.annotate(image_np, filtered_detections, labels)
+
+                vis_path = vis_dir / f"{img_path.stem}_vis.png"
+                Image.fromarray(image_np).save(str(vis_path))
+
+            t_postprocess_end = time.perf_counter()
+            t_img_end = time.perf_counter()
+
+            postprocess_times.append(t_postprocess_end - t_postprocess_start)
+            total_times.append(t_img_end - t_img_start)
+
+            image_id += 1
+
+            # Incremental COCO saving every 100 images
+            if save_coco and image_id % 100 == 0:
+                coco_json_path = output_dir / 'coco_annotations.json'
+                with open(coco_json_path, 'w') as f:
+                    json.dump(coco_data, f, indent=2)
+
+            # Update progress bar
+            pbar.set_postfix_str(f"{num_all_detections} detections")
+            pbar.update(1)
     
     t_total_end = time.perf_counter()
     
-    # Save COCO JSON
+    # Final COCO JSON save
     if save_coco:
         coco_json_path = output_dir / 'coco_annotations.json'
         with open(coco_json_path, 'w') as f:
             json.dump(coco_data, f, indent=2)
-        print(f"\nCOCO annotations saved: {coco_json_path}")
+        print(f"COCO annotations saved: {coco_json_path}")
         print(f"  Total annotations: {len(coco_data['annotations'])} (ALL detections with scores)")
     
     # Print summary
@@ -892,18 +975,25 @@ def main():
     output_dir = args['<output_dir>']
     
     # Parse options
-    imgz = int(args['--imgz']) if args['--imgz'] else None
-    conf_threshold = float(args['--conf-threshold'])
     model_size = args['--model-size']
+    conf_threshold = float(args['--conf-threshold'])
     device = args['--device']
     num_classes = int(args['--num-classes']) if args['--num-classes'] else None
+    sample_size = int(args['--sample-size']) if args['--sample-size'] else None
     save_txt = args['--save-txt']
     save_coco = args['--save-coco']
     save_masks = args['--save-masks']
     save_instances = args['--save-instances']
     visualize = args['--visualize']
     hide_labels = args['--hide-labels']
-    segmentation = not args['--no-segmentation']
+    
+    # Auto-detect segmentation if --no-segmentation is not specified
+    # If --no-segmentation is specified, set segmentation to False
+    # Otherwise, leave as None to auto-detect
+    if args['--no-segmentation']:
+        segmentation = False
+    else:
+        segmentation = None  # Will be auto-detected from checkpoint
     
     # Parse class filter
     filter_classes = None
@@ -914,7 +1004,6 @@ def main():
         images_dir=images_dir,
         weights_path=weights_path,
         output_dir=output_dir,
-        imgz=imgz,
         model_size=model_size,
         conf_threshold=conf_threshold,
         num_classes=num_classes,
@@ -927,6 +1016,7 @@ def main():
         hide_labels=hide_labels,
         filter_classes=filter_classes,
         segmentation=segmentation,
+        sample_size=sample_size,
     )
 
 
