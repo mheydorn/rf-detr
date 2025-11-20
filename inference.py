@@ -17,6 +17,7 @@ Options:
     --conf-threshold=<th>            Confidence threshold for visualizations and txt output [default: 0.5]
                                      Note: COCO JSON (--save-coco) always saves ALL detections with scores,
                                      allowing downstream software to apply its own thresholding
+    --coco-threshold=<th>            Confidence threshold specifically for COCO labels (separate from conf-threshold) [default: 0]
     --model-size=<size>              Model size (nano, small, medium, large) [default: small]
     --device=<device>                Device to run inference on (cpu, cuda, mps, or cuda:0, cuda:1, etc.) [default: cuda]
     --num-classes=<classes>          Number of classes (only required if checkpoint doesn't contain class names)
@@ -451,6 +452,7 @@ def run_inference(
     output_dir: str,
     model_size: str = 'small',
     conf_threshold: float = 0.5,
+    coco_threshold: float = 0,
     num_classes: Optional[int] = None,
     device: str = 'cpu',
     save_txt: bool = False,
@@ -474,6 +476,7 @@ def run_inference(
         output_dir: Directory to save outputs
         model_size: Model size (nano, small, medium, large)
         conf_threshold: Confidence threshold for detections
+        coco_threshold: Confidence threshold specifically for COCO labels (separate from conf_threshold)
         num_classes: Number of classes (only needed if not in checkpoint)
         device: Device to run inference on
         save_txt: Save detection results as txt files
@@ -633,7 +636,11 @@ def run_inference(
     print(f"Device: {device}")
     print(f"Confidence threshold: {conf_threshold} (for visualizations/txt only)")
     if save_coco:
-        print(f"COCO output: ALL detections saved with scores (threshold filtering in downstream tools)")
+        print(f"COCO threshold: {coco_threshold} (filters COCO labels before saving)")
+        if coco_threshold == 0:
+            print(f"COCO output: ALL detections saved with scores (no threshold filtering)")
+        else:
+            print(f"COCO output: detections >= {coco_threshold} threshold saved")
     print(f"Classes: {num_classes} ({', '.join(class_names[:5])}{'...' if len(class_names) > 5 else ''})")
     print(f"Output directory: {output_dir}")
     
@@ -801,8 +808,8 @@ def run_inference(
                     if mask is not None:
                         polygon = mask_to_polygon(mask)
 
-                    # Add COCO annotation (always saves all detections with scores)
-                    if save_coco:
+                    # Add COCO annotation (apply coco_threshold filter)
+                    if save_coco and confidence >= coco_threshold:
                         annotation = create_coco_annotation(
                             annotation_id, image_id, class_id,
                             box, confidence, polygon, mask
@@ -977,6 +984,7 @@ def main():
     # Parse options
     model_size = args['--model-size']
     conf_threshold = float(args['--conf-threshold'])
+    coco_threshold = float(args['--coco-threshold'])
     device = args['--device']
     num_classes = int(args['--num-classes']) if args['--num-classes'] else None
     sample_size = int(args['--sample-size']) if args['--sample-size'] else None
@@ -1006,6 +1014,7 @@ def main():
         output_dir=output_dir,
         model_size=model_size,
         conf_threshold=conf_threshold,
+        coco_threshold=coco_threshold,
         num_classes=num_classes,
         device=device,
         save_txt=save_txt,

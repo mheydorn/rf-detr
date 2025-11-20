@@ -28,6 +28,92 @@ def load_class_names(dataset_dir):
     raise ValueError(f"Could not find class names in {dataset_dir}")
 
 
+def validate_segmentation_annotations(dataset_dir):
+    """
+    Validate and fix segmentation annotations before training.
+    This prevents crashes during evaluation due to malformed polygons.
+    """
+    print("\nValidating segmentation annotations...")
+    
+    dataset_path = Path(dataset_dir)
+    splits = ['train', 'valid', 'test']
+    total_fixed = 0
+    total_removed = 0
+    
+    for split in splits:
+        ann_file = dataset_path / split / "_annotations.coco.json"
+        if not ann_file.exists():
+            continue
+        
+        with open(ann_file, 'r') as f:
+            data = json.load(f)
+        
+        if 'annotations' not in data:
+            continue
+        
+        original_count = len(data['annotations'])
+        valid_annotations = []
+        removed_count = 0
+        fixed_count = 0
+        
+        for ann in data['annotations']:
+            if 'segmentation' not in ann:
+                valid_annotations.append(ann)
+                continue
+            
+            segm = ann['segmentation']
+            
+            # Skip RLE format (already encoded)
+            if isinstance(segm, dict):
+                valid_annotations.append(ann)
+                continue
+            
+            # Validate polygon format
+            if not isinstance(segm, list) or len(segm) == 0:
+                removed_count += 1
+                continue
+            
+            # Filter out invalid polygons
+            valid_polygons = []
+            for poly in segm:
+                if not isinstance(poly, list):
+                    continue
+                # Polygon must have at least 3 points (6 coordinates)
+                if len(poly) >= 6:
+                    valid_polygons.append(poly)
+            
+            # Keep annotation only if it has at least one valid polygon
+            if len(valid_polygons) > 0:
+                if len(valid_polygons) != len(segm):
+                    fixed_count += 1
+                    ann['segmentation'] = valid_polygons
+                valid_annotations.append(ann)
+            else:
+                removed_count += 1
+        
+        # Save fixed annotations if needed
+        if removed_count > 0 or fixed_count > 0:
+            # Create backup if it doesn't exist
+            backup_file = ann_file.with_suffix('.json.backup')
+            if not backup_file.exists():
+                with open(backup_file, 'w') as f:
+                    json.dump(data, f, indent=2)
+            
+            # Save cleaned data
+            data['annotations'] = valid_annotations
+            with open(ann_file, 'w') as f:
+                json.dump(data, f, indent=2)
+            
+            print(f"  {split}: Fixed {fixed_count}, removed {removed_count} invalid annotations (backup saved)")
+            total_fixed += fixed_count
+            total_removed += removed_count
+    
+    if total_fixed > 0 or total_removed > 0:
+        print(f"✓ Validation complete: Fixed {total_fixed}, removed {total_removed} annotations")
+    else:
+        print("✓ All annotations are valid")
+
+
 def train_segmentation_model(
     dataset_dir,
     output_dir,
@@ -41,6 +127,7 @@ def train_segmentation_model(
     use_pretrained=True,
     device="cuda",
     resume=None,
+    patience=15,
 ):
     """
     Train an RF-DETR segmentation model on any COCO-format dataset.
@@ -56,6 +143,7 @@ def train_segmentation_model(
         num_workers: Number of data loading workers
         use_pretrained: Whether to use pretrained weights
         resume: Path to checkpoint file to resume training from
+        patience: Early stopping patience (number of epochs without improvement)
     """
     dataset_path = Path(dataset_dir)
     output_path = Path(output_dir)
@@ -63,6 +151,9 @@ def train_segmentation_model(
     print("=" * 80)
     print("RF-DETR Segmentation Model Training")
     print("=" * 80)
+    
+    # Validate and fix segmentation annotations before training
+    validate_segmentation_annotations(dataset_dir)
     
     # Load class names
     class_names = load_class_names(dataset_dir)
@@ -125,7 +216,7 @@ def train_segmentation_model(
         'use_ema': True,
         'ema_decay': 0.993,
         'early_stopping': True,
-        'early_stopping_patience': 15,
+        'early_stopping_patience': patience,
         'tensorboard': True,
         'wandb': False,
         'multi_scale': True,
@@ -254,6 +345,12 @@ if __name__ == "__main__":
         default=None,
         help="Path to checkpoint file to resume training from (e.g., output_dir/checkpoint.pth)"
     )
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=15,
+        help="Early stopping patience (number of epochs without improvement)"
+    )
     
     args = parser.parse_args()
     
@@ -270,5 +367,6 @@ if __name__ == "__main__":
         use_pretrained=not args.no_pretrained,
         device=args.device,
         resume=args.resume,
+        patience=args.patience,
     )
 
