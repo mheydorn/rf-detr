@@ -30,6 +30,10 @@ Options:
     --hide-labels                    Hide class labels on bounding boxes in visualization
     --filter-classes=<ids>           Filter by class indices (comma-separated)
     --no-segmentation                Disable segmentation head (detection only)
+    --min=<size>                     Minimum detection size in square pixels (exclude smaller detections)
+    --max=<size>                     Maximum detection size in square pixels (exclude larger detections)
+    --all-fm                         Convert all predictions to "fm" class regardless of original class
+    --additional-weights=<path>      Additional weights file to run inference with (detections pooled together)
 
 Note: Image resolution is automatically loaded from the checkpoint file.
 
@@ -384,6 +388,50 @@ def create_coco_annotation(
     return annotation
 
 
+def merge_detections(detections1: sv.Detections, detections2: sv.Detections) -> sv.Detections:
+    """
+    Merge two supervision Detections objects into one.
+    
+    Args:
+        detections1: First set of detections
+        detections2: Second set of detections
+        
+    Returns:
+        Merged Detections object containing all detections from both inputs
+    """
+    # Handle empty cases
+    if len(detections1) == 0:
+        return detections2
+    if len(detections2) == 0:
+        return detections1
+    
+    # Merge bounding boxes
+    merged_xyxy = np.concatenate([detections1.xyxy, detections2.xyxy], axis=0)
+    
+    # Merge confidence scores
+    merged_confidence = np.concatenate([detections1.confidence, detections2.confidence], axis=0)
+    
+    # Merge class IDs
+    merged_class_id = np.concatenate([detections1.class_id, detections2.class_id], axis=0)
+    
+    # Merge masks if present
+    merged_mask = None
+    if detections1.mask is not None and detections2.mask is not None:
+        merged_mask = np.concatenate([detections1.mask, detections2.mask], axis=0)
+    elif detections1.mask is not None:
+        merged_mask = detections1.mask
+    elif detections2.mask is not None:
+        merged_mask = detections2.mask
+    
+    # Create merged detections
+    return sv.Detections(
+        xyxy=merged_xyxy,
+        confidence=merged_confidence,
+        class_id=merged_class_id,
+        mask=merged_mask
+    )
+
+
 def save_combined_masks(
     masks: List[np.ndarray],
     class_ids: List[int],
@@ -464,6 +512,10 @@ def run_inference(
     filter_classes: Optional[List[int]] = None,
     segmentation: Optional[bool] = None,
     sample_size: Optional[int] = None,
+    min_size: Optional[float] = None,
+    max_size: Optional[float] = None,
+    all_fm: bool = False,
+    additional_weights: Optional[str] = None,
 ):
     """
     Run RF-DETR inference on a directory of images.
@@ -488,6 +540,10 @@ def run_inference(
         filter_classes: Filter by specific class indices
         segmentation: Enable segmentation head (auto-detected if None)
         sample_size: If specified, only process first N images
+        min_size: Minimum detection size in square pixels (exclude smaller)
+        max_size: Maximum detection size in square pixels (exclude larger)
+        all_fm: Convert all predictions to "fm" class
+        additional_weights: Path to additional weights file (detections pooled with primary)
     """
     # Validate that at least one output is specified
     if not any([save_txt, save_coco, save_masks, save_instances, visualize]):
@@ -509,6 +565,13 @@ def run_inference(
         raise FileNotFoundError(f"Images directory not found: {images_dir}")
     if not weights_path.exists():
         raise FileNotFoundError(f"Weights file not found: {weights_path}")
+    
+    # Validate additional weights if provided
+    additional_weights_path = None
+    if additional_weights:
+        additional_weights_path = Path(additional_weights)
+        if not additional_weights_path.exists():
+            raise FileNotFoundError(f"Additional weights file not found: {additional_weights_path}")
     
     # Auto-detect segmentation capability from checkpoint if not explicitly specified
     if segmentation is None:
@@ -631,6 +694,8 @@ def run_inference(
     print(f"RF-DETR Inference")
     print(f"{'='*80}")
     print(f"Model: {weights_path}")
+    if additional_weights_path:
+        print(f"Additional model: {additional_weights_path}")
     print(f"Model size: {model_size}")
     print(f"Segmentation: {segmentation}")
     print(f"Device: {device}")
@@ -643,6 +708,25 @@ def run_inference(
             print(f"COCO output: detections >= {coco_threshold} threshold saved")
     print(f"Classes: {num_classes} ({', '.join(class_names[:5])}{'...' if len(class_names) > 5 else ''})")
     print(f"Output directory: {output_dir}")
+    if min_size is not None:
+        print(f"Min size filter: {min_size} sq pixels")
+    if max_size is not None:
+        print(f"Max size filter: {max_size} sq pixels")
+    
+    # Find "fm" class index if --all-fm is specified
+    fm_class_index = None
+    if all_fm:
+        # Look for "fm" class in class names (case-insensitive)
+        for idx, name in enumerate(class_names):
+            if name.lower() == 'fm':
+                fm_class_index = idx
+                break
+        if fm_class_index is None:
+            raise ValueError(
+                "Cannot use --all-fm: 'fm' class not found in class names!\n"
+                f"Available classes: {class_names}"
+            )
+        print(f"All-FM mode: Converting all detections to class 'fm' (index {fm_class_index})")
     
     # Select model class
     model_classes = {
@@ -679,6 +763,50 @@ def run_inference(
         print(f"Model optimization successful ({t_opt_end - t_opt_start:.3f}s)")
     except Exception as e:
         print(f"Warning: Could not optimize model: {e}")
+    
+    # Load additional model if specified
+    additional_model = None
+    if additional_weights_path:
+        print(f"\nLoading additional model from {additional_weights_path}...")
+        t_load_add_start = time.perf_counter()
+        
+        # Get resolution from additional checkpoint
+        try:
+            add_checkpoint = torch.load(additional_weights_path, map_location='cpu', weights_only=False)
+            add_resolution = None
+            if 'args' in add_checkpoint:
+                if hasattr(add_checkpoint['args'], 'resolution'):
+                    add_resolution = add_checkpoint['args'].resolution
+            if add_resolution is None:
+                add_resolution = imgz  # Use primary model's resolution as fallback
+                print(f"  Using primary model resolution: {add_resolution}")
+            else:
+                print(f"  Resolution from checkpoint: {add_resolution}")
+        except Exception as e:
+            print(f"  Warning: Could not load resolution from additional checkpoint: {e}")
+            add_resolution = imgz
+        
+        # Auto-detect segmentation for additional model
+        add_has_seg = detect_model_has_segmentation(str(additional_weights_path))
+        add_segmentation = add_has_seg if segmentation is None else segmentation
+        print(f"  Segmentation: {add_segmentation}")
+        
+        additional_model = model_class(
+            num_classes=num_classes,
+            pretrain_weights=str(additional_weights_path),
+            segmentation_head=add_segmentation,
+            device=device,
+            resolution=add_resolution,
+        )
+        t_load_add_end = time.perf_counter()
+        print(f"  Additional model loaded in {t_load_add_end - t_load_add_start:.3f}s")
+        
+        # Optimize additional model
+        try:
+            additional_model.optimize_for_inference()
+            print(f"  Additional model optimization successful")
+        except Exception as e:
+            print(f"  Warning: Could not optimize additional model: {e}")
     
     # Get list of images
     image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif']
@@ -737,6 +865,12 @@ def run_inference(
             # This ensures COCO output contains all predictions with scores
             t_infer_start = time.perf_counter()
             all_detections = model.predict(image, threshold=0.01)
+            
+            # Run inference with additional model and merge detections
+            if additional_model is not None:
+                additional_detections = additional_model.predict(image, threshold=0.01)
+                all_detections = merge_detections(all_detections, additional_detections)
+            
             t_infer_end = time.perf_counter()
             inference_times.append(t_infer_end - t_infer_start)
 
@@ -751,6 +885,18 @@ def run_inference(
                 filter_cats = [reverse_mapping.get(c, c) for c in filter_classes]
                 mask = np.isin(all_detections.class_id, filter_cats)
                 all_detections = all_detections[mask]
+
+            # Filter by size (area in square pixels)
+            if len(all_detections) > 0 and (min_size is not None or max_size is not None):
+                boxes = all_detections.xyxy
+                # Calculate area: (x2 - x1) * (y2 - y1)
+                areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+                size_mask = np.ones(len(all_detections), dtype=bool)
+                if min_size is not None:
+                    size_mask &= (areas >= min_size)
+                if max_size is not None:
+                    size_mask &= (areas <= max_size)
+                all_detections = all_detections[size_mask]
 
             # Show category mapping if detections present
             if len(all_detections) > 0 and image_id == 1:  # Only show once
@@ -794,6 +940,9 @@ def run_inference(
                 for i in range(num_all_detections):
                     category_id = int(all_class_ids_raw[i])  # Original category ID from model
                     class_id = category_mapping.get(category_id, category_id)  # Mapped to class index
+                    # Override class to "fm" if --all-fm is specified
+                    if all_fm and fm_class_index is not None:
+                        class_id = fm_class_index
                     confidence = float(all_confidences[i])
                     box = all_boxes[i]
                     mask = all_masks[i] if all_masks is not None else None
@@ -827,6 +976,9 @@ def run_inference(
                 for i in range(num_filtered_detections):
                     category_id = int(filt_class_ids_raw[i])
                     class_id = category_mapping.get(category_id, category_id)
+                    # Override class to "fm" if --all-fm is specified
+                    if all_fm and fm_class_index is not None:
+                        class_id = fm_class_index
                     confidence = float(filt_confidences[i])
                     mask = filt_masks[i] if filt_masks is not None else None
                     box = filt_boxes[i]
@@ -868,35 +1020,40 @@ def run_inference(
                 with open(txt_path, 'w') as f:
                     f.write('\n'.join(txt_lines))
 
-            # Save visualization (only shows detections above threshold)
-            if visualize and num_filtered_detections > 0:
+            # Save visualization (saves all images, annotates those with detections above threshold)
+            if visualize:
                 image_np = np.array(image)
 
-                # Get filtered detection data for visualization
-                filt_class_ids_raw = filtered_detections.class_id
-                filt_confidences = filtered_detections.confidence
-                filt_masks = filtered_detections.mask if segmentation and filtered_detections.mask is not None else None
+                # Only annotate if there are detections above threshold
+                if num_filtered_detections > 0:
+                    # Get filtered detection data for visualization
+                    filt_class_ids_raw = filtered_detections.class_id
+                    filt_confidences = filtered_detections.confidence
+                    filt_masks = filtered_detections.mask if segmentation and filtered_detections.mask is not None else None
 
-                # Create annotated image
-                if segmentation and filt_masks is not None:
-                    mask_annotator = sv.MaskAnnotator()
-                    image_np = mask_annotator.annotate(image_np, filtered_detections)
+                    # Create annotated image
+                    if segmentation and filt_masks is not None:
+                        mask_annotator = sv.MaskAnnotator()
+                        image_np = mask_annotator.annotate(image_np, filtered_detections)
 
-                box_annotator = sv.BoxAnnotator()
-                image_np = box_annotator.annotate(image_np, filtered_detections)
+                    box_annotator = sv.BoxAnnotator()
+                    image_np = box_annotator.annotate(image_np, filtered_detections)
 
-                if not hide_labels:
-                    labels = []
-                    for category_id, conf in zip(filt_class_ids_raw, filt_confidences):
-                        # Map category ID to class index for label lookup
-                        class_id = category_mapping.get(category_id, category_id)
-                        if 0 <= class_id < len(class_names):
-                            labels.append(f"{class_names[class_id]} {conf:.2f}")
-                        else:
-                            labels.append(f"class_{class_id} {conf:.2f}")
+                    if not hide_labels:
+                        labels = []
+                        for category_id, conf in zip(filt_class_ids_raw, filt_confidences):
+                            # Map category ID to class index for label lookup
+                            class_id = category_mapping.get(category_id, category_id)
+                            # Override class to "fm" if --all-fm is specified
+                            if all_fm and fm_class_index is not None:
+                                class_id = fm_class_index
+                            if 0 <= class_id < len(class_names):
+                                labels.append(f"{class_names[class_id]} {conf:.2f}")
+                            else:
+                                labels.append(f"class_{class_id} {conf:.2f}")
 
-                    label_annotator = sv.LabelAnnotator()
-                    image_np = label_annotator.annotate(image_np, filtered_detections, labels)
+                        label_annotator = sv.LabelAnnotator()
+                        image_np = label_annotator.annotate(image_np, filtered_detections, labels)
 
                 vis_path = vis_dir / f"{img_path.stem}_vis.png"
                 Image.fromarray(image_np).save(str(vis_path))
@@ -1008,6 +1165,12 @@ def main():
     if args['--filter-classes']:
         filter_classes = [int(x) for x in args['--filter-classes'].split(',')]
     
+    # Parse size filters
+    min_size = float(args['--min']) if args['--min'] else None
+    max_size = float(args['--max']) if args['--max'] else None
+    all_fm = args['--all-fm']
+    additional_weights = args['--additional-weights']
+    
     run_inference(
         images_dir=images_dir,
         weights_path=weights_path,
@@ -1026,6 +1189,10 @@ def main():
         filter_classes=filter_classes,
         segmentation=segmentation,
         sample_size=sample_size,
+        min_size=min_size,
+        max_size=max_size,
+        all_fm=all_fm,
+        additional_weights=additional_weights,
     )
 
 
