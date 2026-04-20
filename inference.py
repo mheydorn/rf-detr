@@ -71,7 +71,8 @@ from pathlib import Path
 from docopt import docopt
 from datetime import datetime
 from PIL import Image
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import supervision as sv
 from tqdm import tqdm
 
@@ -84,7 +85,90 @@ except ImportError as e:
     sys.exit(1)
 
 
-def detect_model_has_segmentation(weights_path: str) -> bool:
+def load_image(img_path: Path) -> Tuple[Path, Optional[Image.Image], Optional[Tuple[int, int]], Optional[str]]:
+    """
+    Load a single image from disk.
+    
+    Args:
+        img_path: Path to image file
+        
+    Returns:
+        Tuple of (path, PIL Image, (width, height), error_message)
+        If loading fails, image and size will be None and error_message will be set
+    """
+    try:
+        image = Image.open(img_path).convert('RGB')
+        return (img_path, image, image.size, None)
+    except Exception as e:
+        return (img_path, None, None, str(e))
+
+
+def prefetch_images(
+    image_paths: List[Path],
+    num_workers: int = 4,
+    prefetch_factor: int = 2
+) -> Iterator[Tuple[Path, Optional[Image.Image], Optional[Tuple[int, int]], Optional[str]]]:
+    """
+    Generator that prefetches images in background threads.
+    
+    Uses a thread pool to load images ahead of consumption, overlapping
+    I/O with compute. Maintains order of images.
+    
+    Args:
+        image_paths: List of image paths to load
+        num_workers: Number of worker threads for loading
+        prefetch_factor: How many images to prefetch per worker
+        
+    Yields:
+        Tuple of (path, PIL Image, (width, height), error_message)
+    """
+    max_prefetch = num_workers * prefetch_factor
+    
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        # Submit initial batch of tasks
+        futures = {}
+        path_iter = iter(enumerate(image_paths))
+        
+        # Fill the prefetch buffer
+        for _ in range(min(max_prefetch, len(image_paths))):
+            try:
+                idx, path = next(path_iter)
+                future = executor.submit(load_image, path)
+                futures[future] = idx
+            except StopIteration:
+                break
+        
+        # Results buffer to maintain order
+        results = {}
+        next_idx = 0
+        
+        while futures or next_idx < len(image_paths):
+            # Wait for any future to complete
+            if futures:
+                done_futures = []
+                for future in as_completed(futures):
+                    done_futures.append(future)
+                    break  # Just get one at a time to maintain flow
+                
+                for future in done_futures:
+                    idx = futures.pop(future)
+                    results[idx] = future.result()
+                    
+                    # Submit next task if available
+                    try:
+                        new_idx, path = next(path_iter)
+                        new_future = executor.submit(load_image, path)
+                        futures[new_future] = new_idx
+                    except StopIteration:
+                        pass
+            
+            # Yield results in order
+            while next_idx in results:
+                yield results.pop(next_idx)
+                next_idx += 1
+
+
+def detect_model_has_segmentation(weights_path: str, checkpoint: Optional[dict] = None) -> bool:
     """
     Detect if a model checkpoint has segmentation capability.
     
@@ -93,12 +177,14 @@ def detect_model_has_segmentation(weights_path: str) -> bool:
     
     Args:
         weights_path: Path to checkpoint file
+        checkpoint: Pre-loaded checkpoint dict (optional, avoids redundant loading)
         
     Returns:
         True if model has segmentation head, False if detection-only
     """
     try:
-        checkpoint = torch.load(weights_path, map_location='cpu', weights_only=False)
+        if checkpoint is None:
+            checkpoint = torch.load(weights_path, map_location='cpu', weights_only=False)
         
         # Check args for segmentation flag (most reliable)
         if 'args' in checkpoint:
@@ -573,10 +659,26 @@ def run_inference(
         if not additional_weights_path.exists():
             raise FileNotFoundError(f"Additional weights file not found: {additional_weights_path}")
     
+    # Load checkpoint once and reuse for all metadata extraction
+    checkpoint = None
+    checkpoint_class_names = None
+    checkpoint_resolution = None
+    try:
+        checkpoint = torch.load(weights_path, map_location='cpu', weights_only=False)
+        if 'args' in checkpoint:
+            if hasattr(checkpoint['args'], 'class_names'):
+                checkpoint_class_names = checkpoint['args'].class_names
+                print(f"Found class names in checkpoint: {len(checkpoint_class_names)} classes")
+            if hasattr(checkpoint['args'], 'resolution'):
+                checkpoint_resolution = checkpoint['args'].resolution
+                print(f"Found resolution in checkpoint: {checkpoint_resolution}")
+    except Exception as e:
+        print(f"Warning: Could not load data from checkpoint: {e}")
+    
     # Auto-detect segmentation capability from checkpoint if not explicitly specified
     if segmentation is None:
         print("Auto-detecting segmentation capability from checkpoint...")
-        has_segmentation = detect_model_has_segmentation(str(weights_path))
+        has_segmentation = detect_model_has_segmentation(str(weights_path), checkpoint=checkpoint)
         segmentation = has_segmentation
         print(f"Model type: {'Segmentation' if segmentation else 'Detection-only'}")
     
@@ -594,21 +696,6 @@ def run_inference(
                 f"The checkpoint '{weights_path.name}' is a detection-only model.\n"
                 "Remove --save-instances to proceed with detection-only inference."
             )
-    
-    # Try to load class names and resolution from checkpoint
-    checkpoint_class_names = None
-    checkpoint_resolution = None
-    try:
-        checkpoint = torch.load(weights_path, map_location='cpu', weights_only=False)
-        if 'args' in checkpoint:
-            if hasattr(checkpoint['args'], 'class_names'):
-                checkpoint_class_names = checkpoint['args'].class_names
-                print(f"Found class names in checkpoint: {len(checkpoint_class_names)} classes")
-            if hasattr(checkpoint['args'], 'resolution'):
-                checkpoint_resolution = checkpoint['args'].resolution
-                print(f"Found resolution in checkpoint: {checkpoint_resolution}")
-    except Exception as e:
-        print(f"Warning: Could not load data from checkpoint: {e}")
     
     # Use checkpoint class names or generate default names
     if checkpoint_class_names is not None:
@@ -770,10 +857,11 @@ def run_inference(
         print(f"\nLoading additional model from {additional_weights_path}...")
         t_load_add_start = time.perf_counter()
         
-        # Get resolution from additional checkpoint
+        # Get resolution from additional checkpoint (load once, reuse for segmentation detection)
+        add_checkpoint = None
+        add_resolution = None
         try:
             add_checkpoint = torch.load(additional_weights_path, map_location='cpu', weights_only=False)
-            add_resolution = None
             if 'args' in add_checkpoint:
                 if hasattr(add_checkpoint['args'], 'resolution'):
                     add_resolution = add_checkpoint['args'].resolution
@@ -786,8 +874,8 @@ def run_inference(
             print(f"  Warning: Could not load resolution from additional checkpoint: {e}")
             add_resolution = imgz
         
-        # Auto-detect segmentation for additional model
-        add_has_seg = detect_model_has_segmentation(str(additional_weights_path))
+        # Auto-detect segmentation for additional model (reuse loaded checkpoint)
+        add_has_seg = detect_model_has_segmentation(str(additional_weights_path), checkpoint=add_checkpoint)
         add_segmentation = add_has_seg if segmentation is None else segmentation
         print(f"  Segmentation: {add_segmentation}")
         
@@ -842,24 +930,30 @@ def run_inference(
     postprocess_times = []
     total_times = []
 
+    # Pre-create annotators once (reused for all images) - significant speedup
+    if visualize:
+        mask_annotator = sv.MaskAnnotator() if segmentation else None
+        box_annotator = sv.BoxAnnotator()
+        label_annotator = sv.LabelAnnotator() if not hide_labels else None
+
     t_total_start = time.perf_counter()
 
-    # Process each image with progress bar
+    # Process each image with progress bar (using prefetch for faster loading)
+    print(f"Using prefetch with 4 workers to overlap image loading with inference")
     with tqdm(total=len(image_paths), desc="Processing images", unit="img") as pbar:
-        for img_path in image_paths:
+        for img_path, image, img_size, load_error in prefetch_images(image_paths, num_workers=4, prefetch_factor=2):
             t_img_start = time.perf_counter()
 
-            # Load image
-            t_load_start = time.perf_counter()
-            try:
-                image = Image.open(img_path).convert('RGB')
-                img_width, img_height = image.size
-            except Exception as e:
-                pbar.set_postfix_str(f"Skipped {img_path.name}: {e}")
+            # Check if image loaded successfully
+            if image is None:
+                pbar.set_postfix_str(f"Skipped {img_path.name}: {load_error}")
                 pbar.update(1)
                 continue
-            t_load_end = time.perf_counter()
-            image_load_times.append(t_load_end - t_load_start)
+            
+            img_width, img_height = img_size
+            # Note: image load time is now overlapped with previous inference
+            # We track a nominal time for statistics but actual wall time is hidden
+            image_load_times.append(0.0)  # Overlapped, so effective time is ~0
 
             # Run inference with very low threshold to get ALL detections
             # This ensures COCO output contains all predictions with scores
@@ -1031,15 +1125,13 @@ def run_inference(
                     filt_confidences = filtered_detections.confidence
                     filt_masks = filtered_detections.mask if segmentation and filtered_detections.mask is not None else None
 
-                    # Create annotated image
-                    if segmentation and filt_masks is not None:
-                        mask_annotator = sv.MaskAnnotator()
+                    # Annotate using pre-created annotators (faster than creating new ones each time)
+                    if segmentation and filt_masks is not None and mask_annotator is not None:
                         image_np = mask_annotator.annotate(image_np, filtered_detections)
 
-                    box_annotator = sv.BoxAnnotator()
                     image_np = box_annotator.annotate(image_np, filtered_detections)
 
-                    if not hide_labels:
+                    if label_annotator is not None:
                         labels = []
                         for category_id, conf in zip(filt_class_ids_raw, filt_confidences):
                             # Map category ID to class index for label lookup
@@ -1052,11 +1144,11 @@ def run_inference(
                             else:
                                 labels.append(f"class_{class_id} {conf:.2f}")
 
-                        label_annotator = sv.LabelAnnotator()
                         image_np = label_annotator.annotate(image_np, filtered_detections, labels)
 
                 vis_path = vis_dir / f"{img_path.stem}_vis.png"
-                Image.fromarray(image_np).save(str(vis_path))
+                # Use cv2.imwrite (faster than PIL) - convert RGB to BGR for cv2
+                cv2.imwrite(str(vis_path), cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR))
 
             t_postprocess_end = time.perf_counter()
             t_img_end = time.perf_counter()
@@ -1066,11 +1158,11 @@ def run_inference(
 
             image_id += 1
 
-            # Incremental COCO saving every 100 images
+            # Incremental COCO saving every 100 images (no indent for speed)
             if save_coco and image_id % 100 == 0:
                 coco_json_path = output_dir / 'coco_annotations.json'
                 with open(coco_json_path, 'w') as f:
-                    json.dump(coco_data, f, indent=2)
+                    json.dump(coco_data, f)
 
             # Update progress bar
             pbar.set_postfix_str(f"{num_all_detections} detections")
@@ -1100,7 +1192,7 @@ def run_inference(
     print(f"{'='*80}")
     print(f"Total processing time: {t_total_end - t_total_start:.3f}s")
     print(f"\nPer-image averages:")
-    print(f"  Image loading:    {np.mean(image_load_times):.3f}s (±{np.std(image_load_times):.3f}s)")
+    print(f"  Image loading:    (overlapped with inference via prefetch)")
     print(f"  Inference:        {np.mean(inference_times):.3f}s (±{np.std(inference_times):.3f}s)")
     print(f"  Postprocessing:   {np.mean(postprocess_times):.3f}s (±{np.std(postprocess_times):.3f}s)")
     print(f"  Total per image:  {np.mean(total_times):.3f}s (±{np.std(total_times):.3f}s)")
